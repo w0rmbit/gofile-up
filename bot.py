@@ -228,3 +228,100 @@ async def handle_search_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, f"❌ No results for `{target_domain}` in any file.", parse_mode="Markdown")
 
     await send_main_menu(chat_id, context)
+# --- Streaming Search with Progress ---
+async def stream_search_with_live_progress(chat_id, context: ContextTypes.DEFAULT_TYPE, source, target_domain, fname):
+    try:
+        progress_msg = await context.bot.send_message(chat_id, "⏳ Starting search...")
+
+        # Prepare search
+        total_bytes = 0
+        bytes_read = 0
+        lines_processed = 0
+        found_lines_stream = io.BytesIO()
+        found_lines_count = 0
+        pattern = re.compile(r'\b' + re.escape(target_domain) + r'\b', re.IGNORECASE)
+        last_percent = 0
+
+        # Local file
+        if os.path.exists(source):
+            with open(source, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    lines_processed += 1
+                    if pattern.search(line):
+                        found_lines_stream.write(line.encode("utf-8"))
+                        found_lines_count += 1
+                    if lines_processed % 5000 == 0:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=f"📊 Processed {lines_processed:,} lines — found {found_lines_count}"
+                        )
+        else:
+            # Remote URL
+            response = requests.get(source, stream=True, timeout=(10, 60))
+            response.raise_for_status()
+            total_bytes = int(response.headers.get('Content-Length', 0))
+
+            for chunk in response.iter_lines(decode_unicode=True):
+                if not chunk:
+                    continue
+                lines_processed += 1
+                bytes_read += len(chunk.encode('utf-8')) + 1
+
+                if pattern.search(chunk):
+                    found_lines_stream.write((chunk + "\n").encode("utf-8"))
+                    found_lines_count += 1
+
+                if total_bytes > 0:
+                    percent = int((bytes_read / total_bytes) * 100)
+                    if percent >= last_percent + 5:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=f"📊 {percent}% done — found {found_lines_count}"
+                        )
+                        last_percent = percent
+                else:
+                    if lines_processed % 5000 == 0:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=f"📊 Processed {lines_processed:,} lines — found {found_lines_count}"
+                        )
+
+        # Final update
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=progress_msg.message_id,
+            text=f"✅ Search complete — found {found_lines_count} matches"
+        )
+
+        if found_lines_count > 0:
+            found_lines_stream.seek(0)
+            await context.bot.send_document(
+                chat_id,
+                document=found_lines_stream,
+                filename=f"search_results_{target_domain}.txt",
+                caption=f"✅ Found {found_lines_count} matches for `{target_domain}` in `{fname}`",
+                parse_mode="Markdown"
+            )
+        else:
+            await context.bot.send_message(chat_id, f"❌ No results for `{target_domain}` in `{fname}`", parse_mode="Markdown")
+
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"⚠️ Error: {e}")
+
+    finally:
+        await send_main_menu(chat_id, context)
+
+# --- Run Bot + Flask ---
+if __name__ == "__main__":
+    print("🤖 Bot is running with Flask health check...")
+    threading.Thread(target=run_flask).start()
+
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CallbackQueryHandler(handle_callback))
+    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app_bot.run_polling()
